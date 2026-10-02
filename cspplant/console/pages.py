@@ -79,9 +79,10 @@ def _mirror_page(platform: Platform) -> str:
 
 
 def _receiver_page(platform: Platform) -> str:
-    """吸热器页：温度带、流量门控与降额。"""
+    """吸热器页：温度带、流量门控、降额与自算热工参数。"""
 
-    snapshot = platform.status()["receiver"]
+    status = platform.status()
+    snapshot = status["receiver"]
     report = platform.temperature_report()
     rows = [
         ("状态", snapshot["state"]),
@@ -98,7 +99,28 @@ def _receiver_page(platform: Platform) -> str:
         ("确认累计 (s)", snapshot["hold_s"]),
         ("跳闸原因", snapshot["trip_reason"] or "-"),
     ]
-    return _shell("吸热器控制台", _table("吸热器状态", rows))
+    body = _table("吸热器状态", rows)
+    adaptive = status["adaptive"]
+    if adaptive["enabled"]:
+        current = adaptive["current"]
+        calibration = adaptive["calibration"]
+        panel = adaptive["zones"]["panel"]
+        verdict = platform.receiver.last_adaptive_verdict()
+        learned_rows = [
+            ("参数版本", f"v{current['version']}（{current['source']}）"),
+            ("热容 自算/标定 (kJ/K)", f"{current['capacity_kj_k']} / {calibration['capacity_kj_k']}"),
+            ("散热 自算/标定 (kW/K)", f"{current['loss_kw_k']} / {calibration['loss_kw_k']}"),
+            ("降额起点 有效/标定 (℃)", f"{panel['derate_start_c']} / {calibration['derate_start_c']}"),
+            ("出力上限 (%)", panel["ceiling_cap_pct"]),
+            ("部位裁决", "、".join(f"{zone}={source}" for zone, source in adaptive["zone_sources"].items())),
+            ("迁移 / 拒绝", f"{adaptive['migrations']} / {adaptive['rejections']}"),
+            ("估计窗口", f"{adaptive['estimator']['samples']} / {adaptive['estimator']['window']} 步"),
+            ("最近判定解释", "-" if verdict is None else verdict.explanation),
+        ]
+    else:
+        learned_rows = [("自算热工参数", "未启用")]
+    body += _table("自算热工参数", learned_rows)
+    return _shell("吸热器控制台", body)
 
 
 def _salt_page(platform: Platform) -> str:

@@ -74,6 +74,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     launch = platform.start_plant(args.dni, args.load_mw, args.minute)
     dispatch = platform.dispatch(100.0, "demo")
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
+    # 中途注入结焦与漂移：自算参数必须迁移到更保守的版本，回放核对必须一致。
+    fouling = platform.receiver.thermal.apply_fouling(0.85, 0.8)
+    fouled_cycles = [platform.cycle(dt=args.dt) for _ in range(max(150, args.cycles // 2))]
+    adaptive = platform.adaptive_report()
+    replay = platform.verify_adaptive_replay()
     forecast = platform.forecast(args.minute, horizon_min=30.0)
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     manual = platform.manual_aim(args.mirror, 195.0, 32.0, "demo-operator")
@@ -102,6 +107,17 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "dispatch": dispatch,
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
+        "fouling": fouling,
+        "fouled_cycles_run": len(fouled_cycles),
+        "adaptive": {
+            "version": adaptive["current"]["version"],
+            "derate_start_c": adaptive["current"]["derate_start_c"],
+            "ceiling_cap_pct": adaptive["current"]["ceiling_cap_pct"],
+            "migrations": adaptive["migrations"],
+            "rejections": adaptive["rejections"],
+            "last_verdict": adaptive["last_verdict"],
+        },
+        "adaptive_replay": replay,
         "forecast": {
             "minutes_to_derate": forecast["minutes_to_derate"],
             "points": forecast["points"][:3],
@@ -123,6 +139,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     _dump(report)
 
     failures = [name for name, item in probe.items() if not item["ok"]]
+    if adaptive["current"]["version"] < 1:
+        failures.append("adaptive:no_migration_after_fouling")
+    if not replay["consistent"] or replay["checked"] < 1:
+        failures.append("adaptive:replay_inconsistent")
     for name, operation in (
         ("launch", launch),
         ("tracking_after_manual", tracking_after_manual),

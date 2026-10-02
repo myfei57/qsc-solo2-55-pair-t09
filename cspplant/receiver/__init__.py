@@ -7,6 +7,16 @@
 
 from __future__ import annotations
 
+from .adaptive import (
+    AdaptiveProtection,
+    AdaptiveVerdict,
+    MigrationResult,
+    ParameterStore,
+    ParameterVersion,
+    ThermalEstimate,
+    ThermalEstimator,
+    replay_verdicts,
+)
 from .derate import DerateController, DerateState
 from .flow import FlowGate, FlowStatus
 from .header import SaltHeader, HeaderState
@@ -18,6 +28,14 @@ from .threshold import ThresholdModel
 from .valve import InletValve
 
 __all__ = [
+    "AdaptiveProtection",
+    "AdaptiveVerdict",
+    "MigrationResult",
+    "ParameterStore",
+    "ParameterVersion",
+    "ThermalEstimate",
+    "ThermalEstimator",
+    "replay_verdicts",
     "DerateController",
     "DerateState",
     "FlowGate",

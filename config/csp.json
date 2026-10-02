@@ -59,6 +59,17 @@
     "alarm": {
       "latch_reset_delay_s": 5.0,
       "escalation_window_s": 120.0
+    },
+    "adaptive": {
+      "enabled": true,
+      "window": 90,
+      "min_temp_rise_c": 4.0,
+      "min_power_swing_kw": 2000.0,
+      "capacity_floor_ratio": 0.5,
+      "loss_floor_ratio": 0.4,
+      "migration_margin_pct": 1.0,
+      "max_residual_ratio": 0.05,
+      "zone_sources": {"panel": "learned", "trip": "calibration"}
     }
   }
 }

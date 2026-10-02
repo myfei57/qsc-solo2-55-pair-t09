@@ -32,6 +32,12 @@ from .ids import IdFactory
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zones import SafeZone, ZoneRegistry
+from .receiver.adaptive import (
+    AdaptiveProtection,
+    ParameterStore,
+    ThermalEstimator,
+    replay_verdicts,
+)
 from .receiver.derate import DerateController
 from .receiver.flow import FlowGate
 from .receiver.header import SaltHeader
@@ -132,6 +138,20 @@ class Platform:
 
         threshold = ThresholdModel(self.config.salt)
         thermal = ThermalModel(self.config.receiver)
+        self.adaptive_params = ParameterStore(
+            self.config.receiver,
+            self.config.adaptive,
+            reference_flow_kg_s=self.config.salt.flow_baseline_kg_s,
+            persistence=store,
+        )
+        self.adaptive = AdaptiveProtection(
+            self.config.receiver,
+            self.config.adaptive,
+            self.adaptive_params,
+            ThermalEstimator(
+                self.config.receiver, self.config.adaptive, thermal.inlet_c
+            ),
+        )
         self.receiver = Receiver(
             self.config.receiver,
             InletValve(self.config.receiver),
@@ -141,6 +161,7 @@ class Platform:
             DerateController(self.config.receiver),
             SaltHeader(self.config.salt),
             threshold,
+            adaptive=self.adaptive if self.config.adaptive.enabled else None,
         )
         self.salt = SaltLoop(
             self.config.salt,
@@ -182,6 +203,7 @@ class Platform:
 
         self._cycles = 0
         self._operations = 0
+        self._last_adaptive_replay: dict | None = None
         self._lock = threading.RLock()
         self._register_namespaces()
         self._restore()
@@ -360,6 +382,7 @@ class Platform:
                 self.clock.now(),
                 load_mw,
             )
+            self._settle_adaptive(self.clock.now())
             summary = self._record_operation(op_id, "startup", report)
             self._operations += 1
             self._persist()
@@ -568,7 +591,8 @@ class Platform:
             power_kw = self.field.thermal_power_kw()
             dispatch_pct = self.field.step_dispatch(dt)
             if self.receiver.header.state() == "admitted":
-                heat = self.receiver.heat(power_kw, self.salt.flow_kg_s(), dt)
+                heat = self.receiver.heat(power_kw, self.salt.flow_kg_s(), dt, now=moment)
+                self._settle_adaptive(moment)
             else:
                 heat = {
                     "ok": True,
@@ -598,6 +622,47 @@ class Platform:
                 "alarms": [event.as_dict() for event in alarms],
                 "state": self.receiver.state(),
             }
+
+    def _settle_adaptive(self, moment: float) -> None:
+        """推进自算保护：取估计、尝试迁移、把判定变化点落审计。
+
+        迁移与判定记录都带版本号落审计，回放时按同一版本重算核对；迁移只会
+        让保护更保守（见 :class:`ParameterStore`），拒绝只计数不刷屏。
+        """
+
+        if not self.config.adaptive.enabled:
+            return
+        estimate = self.adaptive.take_pending_estimate()
+        if estimate is not None:
+            result = self.adaptive_params.propose(estimate, moment)
+            if result.migrated and result.version is not None:
+                version = result.version
+                self.bus.publish(
+                    Event.of(
+                        "receiver",
+                        "receiver",
+                        "adaptive_migration",
+                        severity="notice",
+                        message=(
+                            f"自算热工参数迁移到 v{version.version}："
+                            f"热容 {version.capacity_kj_k:.0f} kJ/K、"
+                            f"散热 {version.loss_kw_k:.2f} kW/K"
+                        ),
+                        **result.as_dict(),
+                    )
+                )
+        verdict = self.receiver.last_adaptive_verdict()
+        if verdict is not None and verdict.changed:
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    "adaptive_verdict",
+                    severity="notice",
+                    message=verdict.explanation,
+                    **verdict.as_dict(),
+                )
+            )
 
     def _signals(self) -> dict:
         """汇总告警判定需要的现场信号。"""
@@ -686,6 +751,45 @@ class Platform:
             self.receiver.derate.active(),
         ).as_dict()
 
+    def adaptive_report(self) -> dict:
+        """返回自算热工参数报告：版本、裁决矩阵、估计器与最近判定解释。"""
+
+        with self._lock:
+            report = self.adaptive.status()
+            verdict = self.receiver.last_adaptive_verdict()
+            report["last_verdict"] = None if verdict is None else verdict.as_dict()
+            report["replay"] = self._last_adaptive_replay
+            return report
+
+    def verify_adaptive_replay(self) -> dict:
+        """回放审计里的降额判定记录，按当时版本重算并核对一致性。
+
+        实时保护、回放与审计按同一版本号解释同一组参数；核对结果（含不一致
+        明细）落审计，不一致时按告警档记录。
+        """
+
+        with self._lock:
+            records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
+            verdicts = [record for record in records if record.action == "adaptive_verdict"]
+            report = replay_verdicts(self.adaptive_params, verdicts)
+            self._last_adaptive_replay = report
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    "adaptive_replay",
+                    severity="notice" if report["consistent"] else "warning",
+                    message=(
+                        f"回放核对 {report['checked']} 条判定记录，"
+                        + ("全部一致" if report["consistent"] else f"{len(report['mismatches'])} 条不一致")
+                    ),
+                    checked=report["checked"],
+                    consistent=report["consistent"],
+                    mismatches=len(report["mismatches"]),
+                )
+            )
+            return report
+
     def forecast(self, minute_of_day: float | None = None, horizon_min: float = 60.0) -> dict:
         """返回未来一段时间的出口温度预估。"""
 
@@ -741,10 +845,12 @@ class Platform:
             "thermal": {
                 "inlet_c": self.receiver.thermal.inlet_c,
                 "capacity_kj_per_k": self.receiver.thermal.capacity_kj_per_k,
+                "loss_kw_per_k": self.receiver.thermal.loss_kw_per_k,
                 "updates": self.receiver.thermal.updates(),
                 "dry_steps": self.receiver.thermal.dry_steps(),
                 "peak_c": round(self.receiver.thermal.peak_c(), 2),
             },
+            "adaptive": self.adaptive.status(),
             "valve_moves": self.receiver.valve.moves(),
             "temperature": self.temperature_report(),
             "salt": self.salt.status(),

@@ -35,6 +35,7 @@ class ThermalModel:
         self._peak_c = self._temp_c
         self._dry_steps = 0
         self._capacity = RECEIVER_CAPACITY_KJ_K
+        self._loss = LOSS_KW_K
 
     @property
     def limits(self) -> ReceiverLimits:
@@ -51,6 +52,30 @@ class ThermalModel:
         """返回等效热容，决定温升的时间常数。"""
 
         return self._capacity
+
+    @property
+    def loss_kw_per_k(self) -> float:
+        """返回按温差的散热系数。"""
+
+        return self._loss
+
+    def apply_fouling(self, capacity_factor: float, loss_factor: float) -> dict:
+        """注入结焦与漂移：等效热容与散热系数按比例劣化。
+
+        真机上结焦会让金属热量传不进熔盐（等效热容下降）、保温劣化或积灰
+        改变散热；这里按比例缩真值，供自算参数在演示与测试中跟踪。
+        """
+
+        capacity_factor = float(capacity_factor)
+        loss_factor = float(loss_factor)
+        if capacity_factor <= 0.0 or loss_factor <= 0.0:
+            raise ValueError("结焦因子必须为正")
+        self._capacity *= capacity_factor
+        self._loss *= loss_factor
+        return {
+            "capacity_kj_per_k": round(self._capacity, 1),
+            "loss_kw_per_k": round(self._loss, 3),
+        }
 
     def reset(self, temperature_c: float | None = None) -> float:
         """把温度复位到给定值（默认环境温度）。"""
@@ -69,7 +94,7 @@ class ThermalModel:
             self._dry_steps += 1
         absorbed = float(power_kw) * dt
         carried = flow * SALT_CP_KJ_KG_K * (self._temp_c - self._inlet_c) * dt
-        lost = LOSS_KW_K * (self._temp_c - self._limits.ambient_c) * dt
+        lost = self._loss * (self._temp_c - self._limits.ambient_c) * dt
         self._temp_c += (absorbed - carried - lost) / self._capacity
         self._temp_c = max(self._limits.ambient_c, self._temp_c)
         self._peak_c = max(self._peak_c, self._temp_c)

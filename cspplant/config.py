@@ -177,6 +177,88 @@ class ReceiverLimits:
         return float(flow_kg_s) >= self.flow_min_kg_s
 
 
+# 部位裁决矩阵允许的来源：自算（learned）或标定（calibration）。
+ADAPTIVE_SOURCES = ("learned", "calibration")
+
+# 裁决矩阵必须覆盖的保护部位：降额（panel）与超温跳闸（trip）。
+ADAPTIVE_ZONES = ("panel", "trip")
+
+
+@dataclass(frozen=True)
+class AdaptiveLimits:
+    """吸热器自算热工参数与部位裁决约束。
+
+    ``zone_sources`` 把每个保护部位的参数来源定死：``panel`` 决定降额起点与
+    出力上限用自算值还是标定值；``trip`` 是材料极限，永远沿用标定，配置里
+    写成自算会在装配阶段直接拒绝。
+    """
+
+    enabled: bool
+    window: int
+    min_temp_rise_c: float
+    min_power_swing_kw: float
+    capacity_floor_ratio: float
+    loss_floor_ratio: float
+    migration_margin_pct: float
+    max_residual_ratio: float
+    zone_sources: Mapping[str, str]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "AdaptiveLimits":
+        enabled = section.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigError("adaptive.enabled 必须是布尔值", component="config")
+        zones = section.get("zone_sources")
+        if not isinstance(zones, Mapping) or not zones:
+            raise ConfigError("adaptive.zone_sources 必须是非空映射", component="config")
+        normalized: dict[str, str] = {}
+        for zone, source in zones.items():
+            if source not in ADAPTIVE_SOURCES:
+                raise ConfigError(
+                    f"部位 {zone!r} 的来源必须是 {ADAPTIVE_SOURCES}", component="config"
+                )
+            normalized[str(zone)] = str(source)
+        for required in ADAPTIVE_ZONES:
+            if required not in normalized:
+                raise ConfigError(f"部位裁决矩阵缺少 {required!r}", component="config")
+        if normalized["trip"] != "calibration":
+            raise ConfigError("超温跳闸门限必须沿用标定，不允许自算", component="config")
+        limits = cls(
+            enabled=enabled,
+            window=_integer(section, "window", minimum=12),
+            min_temp_rise_c=_number(section, "min_temp_rise_c", minimum=0.5),
+            min_power_swing_kw=_number(section, "min_power_swing_kw", minimum=0.0),
+            capacity_floor_ratio=_number(section, "capacity_floor_ratio", minimum=0.05),
+            loss_floor_ratio=_number(section, "loss_floor_ratio", minimum=0.05),
+            migration_margin_pct=_number(section, "migration_margin_pct", minimum=0.0),
+            max_residual_ratio=_number(section, "max_residual_ratio", minimum=0.001),
+            zone_sources=normalized,
+        )
+        if limits.capacity_floor_ratio > 1.0 or limits.loss_floor_ratio > 1.0:
+            raise ConfigError("自算参数下限比例不得超过 1.0", component="config")
+        if limits.migration_margin_pct > 20.0:
+            raise ConfigError("迁移门槛不得高于 20%", component="config")
+        if limits.max_residual_ratio > 1.0:
+            raise ConfigError("估计残差上限不得超过 1.0", component="config")
+        return limits
+
+    @classmethod
+    def defaults(cls) -> "AdaptiveLimits":
+        """配置缺失时的默认自算约束。"""
+
+        return cls(
+            enabled=True,
+            window=90,
+            min_temp_rise_c=4.0,
+            min_power_swing_kw=2000.0,
+            capacity_floor_ratio=0.5,
+            loss_floor_ratio=0.4,
+            migration_margin_pct=1.0,
+            max_residual_ratio=0.05,
+            zone_sources={"panel": "learned", "trip": "calibration"},
+        )
+
+
 @dataclass(frozen=True)
 class SaltLimits:
     """熔盐液位、泵升速与母管压力约束。"""
@@ -299,6 +381,7 @@ class PlatformConfig:
     steam: SteamLimits
     wash: WashLimits
     alarm: AlarmLimits
+    adaptive: AdaptiveLimits
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "PlatformConfig":
@@ -311,6 +394,12 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        adaptive_section = limits.get("adaptive")
+        adaptive = (
+            AdaptiveLimits.from_mapping(adaptive_section)
+            if isinstance(adaptive_section, Mapping)
+            else AdaptiveLimits.defaults()
+        )
         return cls(
             name=name,
             storage_root=storage_root,
@@ -322,6 +411,7 @@ class PlatformConfig:
             steam=SteamLimits.from_mapping(_section(limits, "steam")),
             wash=WashLimits.from_mapping(_section(limits, "wash")),
             alarm=AlarmLimits.from_mapping(_section(limits, "alarm")),
+            adaptive=adaptive,
         )
 
 
@@ -351,6 +441,7 @@ def default_config() -> PlatformConfig:
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
         wash=WashLimits(90.0, 26.0, 4.0, 9.0),
         alarm=AlarmLimits(5.0, 120.0),
+        adaptive=AdaptiveLimits.defaults(),
     )
 
 
@@ -415,6 +506,17 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "alarm": {
                 "latch_reset_delay_s": cfg.alarm.latch_reset_delay_s,
                 "escalation_window_s": cfg.alarm.escalation_window_s,
+            },
+            "adaptive": {
+                "enabled": cfg.adaptive.enabled,
+                "window": cfg.adaptive.window,
+                "min_temp_rise_c": cfg.adaptive.min_temp_rise_c,
+                "min_power_swing_kw": cfg.adaptive.min_power_swing_kw,
+                "capacity_floor_ratio": cfg.adaptive.capacity_floor_ratio,
+                "loss_floor_ratio": cfg.adaptive.loss_floor_ratio,
+                "migration_margin_pct": cfg.adaptive.migration_margin_pct,
+                "max_residual_ratio": cfg.adaptive.max_residual_ratio,
+                "zone_sources": dict(cfg.adaptive.zone_sources),
             },
         },
     }

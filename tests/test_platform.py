@@ -41,7 +41,8 @@ def test_dispatch_is_clamped_by_local_ceiling(platform):
     platform.start()
     platform.track(800.0, 720.0)
     platform.circulate()
-    platform.receiver.derate.evaluate(platform.config.receiver.temp_max_c - 30.0)
+    # 保护判定读的是出口温度传感器；把读数推进降额带，上限必须跟着压下来。
+    platform.receiver.sensor.reset(platform.config.receiver.temp_max_c - 30.0)
     outcome = platform.dispatch(100.0, "auto")
     assert outcome["effective_pct"] < 100.0
     assert outcome["clamped"] is True

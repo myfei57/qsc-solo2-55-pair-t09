@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from ..config import ReceiverLimits
 from ..errors import InterlockError
+from .adaptive import AdaptiveProtection, AdaptiveVerdict
 from .derate import DerateController
 from .flow import FlowGate, FlowStatus
 from .header import SaltHeader
@@ -38,6 +39,7 @@ class Receiver:
         derate: DerateController,
         header: SaltHeader,
         threshold: ThresholdModel,
+        adaptive: AdaptiveProtection | None = None,
     ) -> None:
         self._limits = limits
         self._valve = valve
@@ -47,12 +49,14 @@ class Receiver:
         self._derate = derate
         self._header = header
         self._threshold = threshold
+        self._adaptive = adaptive
         self._state = COLD
         self._trip_reason = ""
         self._trips = 0
         self._heat_steps = 0
         self._last_flow: FlowStatus | None = None
         self._last_threshold: dict = {"ok": True, "threshold_kg_s": self._threshold.threshold_kg_s()}
+        self._last_adaptive_verdict: AdaptiveVerdict | None = None
 
     @property
     def limits(self) -> ReceiverLimits:
@@ -85,6 +89,10 @@ class Receiver:
     @property
     def threshold(self) -> ThresholdModel:
         return self._threshold
+
+    @property
+    def adaptive(self) -> AdaptiveProtection | None:
+        return self._adaptive
 
     def state(self) -> str:
         """返回当前状态。"""
@@ -130,17 +138,24 @@ class Receiver:
         return self._valve.step(dt)
 
     def ceiling_pct(self, flow_kg_s: float) -> float:
-        """给出本地的出力上限：取降额上限与低流量联锁中更保守的一个。"""
+        """给出本地的出力上限：取降额上限与低流量联锁中更保守的一个。
 
-        thermal_limit = 100.0 * self._thermal.derate_factor()
-        ceiling = min(self._derate.current_ceiling_pct(), thermal_limit)
+        接入自算保护后，降额上限由 :class:`AdaptiveProtection` 按部位裁决
+        矩阵给出（自算或标定在配置里定死），不再本地拼接。
+        """
+
+        if self._adaptive is not None:
+            ceiling = self._adaptive.current_ceiling_pct(self._sensor.value_c())
+        else:
+            thermal_limit = 100.0 * self._thermal.derate_factor()
+            ceiling = min(self._derate.current_ceiling_pct(), thermal_limit)
         verdict = self._threshold.evaluate(flow_kg_s)
         self._last_threshold = verdict
         if not verdict["ok"]:
             return 0.0
         return ceiling
 
-    def heat(self, power_kw: float, flow_kg_s: float, dt: float) -> dict:
+    def heat(self, power_kw: float, flow_kg_s: float, dt: float, now: float | None = None) -> dict:
         """带负荷运行一个步长，返回受热报告。"""
 
         if dt <= 0:
@@ -151,11 +166,26 @@ class Receiver:
             raise InterlockError("尚未通盐，禁止带负荷", component="receiver")
 
         self._heat_steps += 1
+        moment = float(self._heat_steps) if now is None else float(now)
+        previous_raw = self._sensor.raw_c()
         temperature = self._thermal.update(power_kw, flow_kg_s, dt)
         filtered = self._sensor.read(temperature)
         state = self._derate.evaluate(filtered)
         verdict = self._threshold.evaluate(flow_kg_s)
         self._last_threshold = verdict
+        adaptive_verdict: AdaptiveVerdict | None = None
+        if self._adaptive is not None:
+            # 估计用原始量测（滤波会滞后温升、带偏回归），判定用滤波后的保护值。
+            self._adaptive.feed(
+                power_kw=power_kw,
+                flow_kg_s=flow_kg_s,
+                temp_prev_c=previous_raw,
+                temp_now_c=temperature,
+                dt=dt,
+                now=moment,
+            )
+            adaptive_verdict = self._adaptive.judge(filtered)
+            self._last_adaptive_verdict = adaptive_verdict
 
         violations: list[str] = []
         if not verdict["ok"]:
@@ -163,12 +193,16 @@ class Receiver:
         if self._limits.overtemperature(filtered):
             self.trip("overtemperature")
             violations.append("overtemperature")
-        elif state.active or self._limits.derate_band(filtered):
+        elif (
+            state.active
+            or self._limits.derate_band(filtered)
+            or (adaptive_verdict is not None and adaptive_verdict.active)
+        ):
             self._state = DERATED
         else:
             self._state = AT_POWER
 
-        return {
+        report = {
             "ok": not violations,
             "state": self._state,
             "temperature_c": round(filtered, 2),
@@ -179,6 +213,9 @@ class Receiver:
             "flow_verdict": verdict,
             "violations": violations,
         }
+        if adaptive_verdict is not None:
+            report["adaptive"] = adaptive_verdict.as_dict()
+        return report
 
     def trip(self, reason: str) -> str:
         """跳闸并记录原因。"""
@@ -218,6 +255,11 @@ class Receiver:
 
         return self._heat_steps
 
+    def last_adaptive_verdict(self) -> AdaptiveVerdict | None:
+        """返回最近一次自算降额判定（未接入自算时为 ``None``）。"""
+
+        return self._last_adaptive_verdict
+
     def output_temperature_c(self) -> float:
         """返回滤波后的出口温度。"""
 
@@ -227,6 +269,14 @@ class Receiver:
         """返回吸热器状态快照。"""
 
         flow = self._last_flow
+        if self._adaptive is not None:
+            ceiling = self._adaptive.current_ceiling_pct(self._sensor.value_c())
+            derated = self._derate.active() or (
+                self._last_adaptive_verdict is not None and self._last_adaptive_verdict.active
+            )
+        else:
+            ceiling = self._derate.ceiling_pct(self._sensor.value_c())
+            derated = self._derate.active()
         return ReceiverSnapshot(
             state=self._state,
             temperature_c=self._sensor.value_c(),
@@ -235,7 +285,7 @@ class Receiver:
             flow_kg_s=0.0 if flow is None else flow.flow_kg_s,
             flow_confirmed=self._gate.confirmed(),
             hold_s=self._gate.hold_s(),
-            derated=self._derate.active(),
-            ceiling_pct=self._derate.ceiling_pct(self._sensor.value_c()),
+            derated=derated,
+            ceiling_pct=ceiling,
             trip_reason=self._trip_reason,
         )
