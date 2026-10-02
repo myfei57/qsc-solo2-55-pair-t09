@@ -54,6 +54,8 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
         add("GET", "/api/store", self._store)
+        add("GET", "/api/self-params", self._self_params)
+        add("GET", "/api/protection/verify", self._protection_verify)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
         add("POST", "/api/track", self._track)
@@ -71,6 +73,8 @@ class Api:
         add("POST", "/api/reset", self._reset)
         add("POST", "/api/concurrency", self._concurrency)
         add("POST", "/api/disturb", self._disturb)
+        add("POST", "/api/receiver/recalibrate", self._receiver_recalibrate)
+        add("POST", "/api/receiver/degrade", self._receiver_degrade)
         add("POST", "/api/plant/reset-state", lambda params, body: {"removed": self._platform.reset_state()})
 
     def routes(self) -> list[dict]:
@@ -276,3 +280,42 @@ class Api:
         if kind == "salt":
             return self._platform.disturb_salt(_as_float(body, "value", 0.2))
         return self._platform.disturb_steam(_as_float(body, "value", 0.0))
+
+    def _self_params(self, params: dict, body: dict) -> dict:
+        """自算参数展示：生效值、原始估计、版本与按部位冻结的来源策略。"""
+
+        status = self._platform.status()
+        return {
+            "self_params": status["self_params"],
+            "policy": status["protection_policy"],
+            "entries": (
+                self._platform.receiver.protection.entry_history()
+                if self._platform.receiver.has_versioned_protection()
+                else []
+            ),
+        }
+
+    def _protection_verify(self, params: dict, body: dict) -> dict:
+        """按当时版本回放保护判定，核对实时/回放/审计一致性。"""
+
+        limit = int(params.get("limit", 100_000))
+        return self._platform.verify_protection_replay(limit=limit)
+
+    def _receiver_recalibrate(self, params: dict, body: dict) -> dict:
+        return self._platform.recalibrate_receiver(
+            _as_float(body, "capacity_kj_per_k", 8_000.0),
+            _as_float(body, "loss_kw_per_k", 6.0),
+            _as_float(body, "flow_gain", 1.0),
+            str(body.get("operator", "maintenance")),
+        )
+
+    def _receiver_degrade(self, params: dict, body: dict) -> dict:
+        def optional(key: str) -> float | None:
+            value = body.get(key)
+            return None if value is None else float(value)
+
+        return self._platform.degrade_receiver(
+            capacity_kj_per_k=optional("capacity_kj_per_k"),
+            loss_kw_per_k=optional("loss_kw_per_k"),
+            flow_gain=optional("flow_gain"),
+        )

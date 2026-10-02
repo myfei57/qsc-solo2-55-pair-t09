@@ -5,6 +5,10 @@
 由热容给出时间常数——没有热容的话温度会在一秒内跳到稳态，既不真实、也让跳闸
 保护失去意义。流量不足时带走的热量变小，温度按同样的时间常数持续爬升，这正是
 干烧保护的物理原因。
+
+真值侧的三个参数（实际热容、实际散热、流量计增益）允许在投运后改变，用来模拟
+用久了结焦、保温老化与流量计漂移：能量平衡始终按真实值走，而控制器看到的流量
+是"指示流量"（真实流量 ÷ 增益），漂移后指示值会高估真实冷却能力。
 """
 
 from __future__ import annotations
@@ -27,14 +31,29 @@ LOSS_KW_K = 6.0
 class ThermalModel:
     """按热功率与流量推算出口熔盐温度。"""
 
-    def __init__(self, limits: ReceiverLimits) -> None:
+    def __init__(
+        self,
+        limits: ReceiverLimits,
+        *,
+        capacity_kj_per_k: float = RECEIVER_CAPACITY_KJ_K,
+        loss_kw_per_k: float = LOSS_KW_K,
+        flow_gain: float = 1.0,
+    ) -> None:
+        if capacity_kj_per_k <= 0:
+            raise ValueError("热容必须为正")
+        if loss_kw_per_k < 0:
+            raise ValueError("散热系数不得为负")
+        if not 0.0 < flow_gain <= 2.0:
+            raise ValueError("流量计增益必须落在 (0, 2]")
         self._limits = limits
         self._inlet_c = INLET_TEMP_C
         self._temp_c = float(limits.ambient_c)
         self._updates = 0
         self._peak_c = self._temp_c
         self._dry_steps = 0
-        self._capacity = RECEIVER_CAPACITY_KJ_K
+        self._capacity = float(capacity_kj_per_k)
+        self._loss = float(loss_kw_per_k)
+        self._flow_gain = float(flow_gain)
 
     @property
     def limits(self) -> ReceiverLimits:
@@ -48,9 +67,43 @@ class ThermalModel:
 
     @property
     def capacity_kj_per_k(self) -> float:
-        """返回等效热容，决定温升的时间常数。"""
+        """返回实际等效热容，决定温升的时间常数。"""
 
         return self._capacity
+
+    @property
+    def loss_kw_per_k(self) -> float:
+        """返回实际散热系数（真值）。"""
+
+        return self._loss
+
+    @property
+    def flow_gain(self) -> float:
+        """返回实际流量计增益：真实流量 = 指示流量 × 增益。"""
+
+        return self._flow_gain
+
+    def degrade(
+        self,
+        *,
+        capacity_kj_per_k: float | None = None,
+        loss_kw_per_k: float | None = None,
+        flow_gain: float | None = None,
+    ) -> None:
+        """注入一次真值侧漂移（结焦／保温老化／流量计漂移），仅供仿真与验证。"""
+
+        if capacity_kj_per_k is not None:
+            if capacity_kj_per_k <= 0:
+                raise ValueError("热容必须为正")
+            self._capacity = float(capacity_kj_per_k)
+        if loss_kw_per_k is not None:
+            if loss_kw_per_k < 0:
+                raise ValueError("散热系数不得为负")
+            self._loss = float(loss_kw_per_k)
+        if flow_gain is not None:
+            if not 0.0 < flow_gain <= 2.0:
+                raise ValueError("流量计增益必须落在 (0, 2]")
+            self._flow_gain = float(flow_gain)
 
     def reset(self, temperature_c: float | None = None) -> float:
         """把温度复位到给定值（默认环境温度）。"""
@@ -60,16 +113,21 @@ class ThermalModel:
         return self._temp_c
 
     def update(self, power_kw: float, flow_kg_s: float, dt: float) -> float:
-        """推进一个步长，返回推进后的出口温度。"""
+        """推进一个步长，返回推进后的出口温度。
+
+        传入的是流量计的**指示流量**；能量平衡按真实流量（指示值×增益）
+        记账，干烧计数仍按指示值与联锁门限比较（联锁只看得到读数）。
+        """
 
         if dt <= 0:
             raise ValueError("步长必须为正")
-        flow = max(0.0, float(flow_kg_s))
-        if flow < self._limits.flow_min_kg_s:
+        indicated = max(0.0, float(flow_kg_s))
+        if indicated < self._limits.flow_min_kg_s:
             self._dry_steps += 1
+        real_flow = indicated * self._flow_gain
         absorbed = float(power_kw) * dt
-        carried = flow * SALT_CP_KJ_KG_K * (self._temp_c - self._inlet_c) * dt
-        lost = LOSS_KW_K * (self._temp_c - self._limits.ambient_c) * dt
+        carried = real_flow * SALT_CP_KJ_KG_K * (self._temp_c - self._inlet_c) * dt
+        lost = self._loss * (self._temp_c - self._limits.ambient_c) * dt
         self._temp_c += (absorbed - carried - lost) / self._capacity
         self._temp_c = max(self._limits.ambient_c, self._temp_c)
         self._peak_c = max(self._peak_c, self._temp_c)
@@ -97,7 +155,12 @@ class ThermalModel:
         return self._dry_steps
 
     def derate_factor(self) -> float:
-        """返回按出口温度给出的出力系数（1.0 表示不降额）。"""
+        """返回按出口温度给出的出力系数（1.0 表示不降额）。
+
+        这是按固定标定阈值的旧口径，仅在未挂版本化保护模型时兜底；
+        投运保护以 :class:`~cspplant.receiver.protection.ProtectionModel`
+        的判定为准。
+        """
 
         if self._temp_c < self._limits.temp_derate_c:
             return 1.0

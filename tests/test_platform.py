@@ -41,7 +41,20 @@ def test_dispatch_is_clamped_by_local_ceiling(platform):
     platform.start()
     platform.track(800.0, 720.0)
     platform.circulate()
-    platform.receiver.derate.evaluate(platform.config.receiver.temp_max_c - 30.0)
+    # 版本化保护按"自算/标定来源按部位定死"的口径压上限：直接喂一个
+    # 高功率、低流量的受热步，保护外推出正的升温速率后提前给出降额上限。
+    platform.receiver.header.admit(True)
+    protection = platform.receiver.protection
+    assert protection is not None
+    decision = protection.evaluate_with_context(
+        platform.config.receiver.temp_derate_c - 5.0,
+        power_kw=200_000.0,
+        flow_indicated_kg_s=platform.salt.flow_kg_s(),
+        dt=1.0,
+        now=platform.clock.now(),
+    )
+    assert decision.active is True
+    assert decision.ceiling_pct < 100.0
     outcome = platform.dispatch(100.0, "auto")
     assert outcome["effective_pct"] < 100.0
     assert outcome["clamped"] is True

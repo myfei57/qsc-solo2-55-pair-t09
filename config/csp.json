@@ -31,7 +31,8 @@
       "flow_min_kg_s": 42.0,
       "flow_confirm_s": 20.0,
       "valve_travel_pct_s": 8.0,
-      "ambient_c": 22.0
+      "ambient_c": 22.0,
+      "derate_lead_s": 20.0
     },
     "salt": {
       "cold_level_min_pct": 18.0,

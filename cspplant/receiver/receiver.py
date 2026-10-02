@@ -3,15 +3,29 @@
 状态在 ``cold``（冷态）、``circulating``（已通盐）、``at_power``（带负荷）、
 ``derated``（降额运行）、``tripped``（跳闸闩锁）之间切换。每次投运都必须先
 确认流量、再通盐、最后才允许带负荷；越限直接跳闸，复位要以闩锁已清除为前提。
+
+降额保护有两个可挂载的实现：未挂版本化保护模型时沿用固定阈值的
+:class:`~cspplant.receiver.derate.DerateController` 兜底；挂上
+:class:`~cspplant.receiver.protection.ProtectionModel` 后，自算/标定来源、
+版本与归因全部以保护模型为准，"按自算还是按标定"在装配时按部位定死，
+不允许运行中切换。
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from ..config import ReceiverLimits
 from ..errors import InterlockError
 from .derate import DerateController
 from .flow import FlowGate, FlowStatus
 from .header import SaltHeader
+from .protection import (
+    Decision,
+    ProtectionModel,
+    effective_for_part,
+    threshold_fixed_point,
+)
 from .sensor import TemperatureSensor
 from .snapshot import ReceiverSnapshot
 from .thermal import ThermalModel
@@ -38,6 +52,7 @@ class Receiver:
         derate: DerateController,
         header: SaltHeader,
         threshold: ThresholdModel,
+        protection: ProtectionModel | None = None,
     ) -> None:
         self._limits = limits
         self._valve = valve
@@ -47,12 +62,15 @@ class Receiver:
         self._derate = derate
         self._header = header
         self._threshold = threshold
+        self._protection = protection
         self._state = COLD
         self._trip_reason = ""
         self._trips = 0
         self._heat_steps = 0
         self._last_flow: FlowStatus | None = None
         self._last_threshold: dict = {"ok": True, "threshold_kg_s": self._threshold.threshold_kg_s()}
+        self._last_observation: dict | None = None
+        self._last_protection: dict | None = None
 
     @property
     def limits(self) -> ReceiverLimits:
@@ -85,6 +103,15 @@ class Receiver:
     @property
     def threshold(self) -> ThresholdModel:
         return self._threshold
+
+    @property
+    def protection(self) -> ProtectionModel | None:
+        return self._protection
+
+    def has_versioned_protection(self) -> bool:
+        """是否挂着版本化自算保护模型。"""
+
+        return self._protection is not None
 
     def state(self) -> str:
         """返回当前状态。"""
@@ -132,15 +159,19 @@ class Receiver:
     def ceiling_pct(self, flow_kg_s: float) -> float:
         """给出本地的出力上限：取降额上限与低流量联锁中更保守的一个。"""
 
-        thermal_limit = 100.0 * self._thermal.derate_factor()
-        ceiling = min(self._derate.current_ceiling_pct(), thermal_limit)
         verdict = self._threshold.evaluate(flow_kg_s)
         self._last_threshold = verdict
         if not verdict["ok"]:
             return 0.0
-        return ceiling
+        if self._protection is not None:
+            decision = self._protection.last_decision()
+            if decision is not None:
+                return decision.ceiling_pct
+            return 100.0
+        thermal_limit = 100.0 * self._thermal.derate_factor()
+        return min(self._derate.current_ceiling_pct(), thermal_limit)
 
-    def heat(self, power_kw: float, flow_kg_s: float, dt: float) -> dict:
+    def heat(self, power_kw: float, flow_kg_s: float, dt: float, now: float = 0.0) -> dict:
         """带负荷运行一个步长，返回受热报告。"""
 
         if dt <= 0:
@@ -153,7 +184,33 @@ class Receiver:
         self._heat_steps += 1
         temperature = self._thermal.update(power_kw, flow_kg_s, dt)
         filtered = self._sensor.read(temperature)
-        state = self._derate.evaluate(filtered)
+
+        if self._protection is not None:
+            # 物理辨识用滤波前原始温度，保护门限判定用滤波后稳态读数。
+            observation = self._protection.observe(power_kw, flow_kg_s, temperature, dt, now)
+            # 阈值与速率取不动点（阈值温度下的速率），保证"起点—速率—上限"
+            # 同口径，回放用记录里的 rate_c_s 即可复算出同一条曲线。
+            effective = effective_for_part(self._protection.state, self._protection.part)
+            threshold, rate = threshold_fixed_point(
+                effective, power_kw, flow_kg_s, self._limits,
+                self._thermal.inlet_c, self._limits.ambient_c,
+                self._protection.lead_s,
+            )
+            decision = self._protection.evaluate_with_context(
+                filtered, power_kw, flow_kg_s, dt, now, rate_c_s=rate
+            )
+            self._last_observation = observation.as_dict()
+            self._last_protection = decision.as_dict()
+            state_active = decision.active
+            decision_dict = decision.as_dict()
+            revision_committed = observation.committed_now
+        else:
+            decision = self._derate.evaluate(filtered)
+            state_active = decision.active
+            decision_dict = decision.as_dict()
+            revision_committed = False
+            observation = None
+
         verdict = self._threshold.evaluate(flow_kg_s)
         self._last_threshold = verdict
 
@@ -163,22 +220,28 @@ class Receiver:
         if self._limits.overtemperature(filtered):
             self.trip("overtemperature")
             violations.append("overtemperature")
-        elif state.active or self._limits.derate_band(filtered):
+        elif state_active or self._limits.derate_band(filtered):
             self._state = DERATED
         else:
             self._state = AT_POWER
 
-        return {
+        report: dict[str, Any] = {
             "ok": not violations,
             "state": self._state,
             "temperature_c": round(filtered, 2),
             "raw_temperature_c": round(temperature, 2),
             "power_kw": round(float(power_kw), 2),
             "flow_kg_s": round(float(flow_kg_s), 3),
-            "derate": state.as_dict(),
+            "derate": decision_dict,
             "flow_verdict": verdict,
             "violations": violations,
         }
+        if self._protection is not None:
+            report["self_params"] = self._last_observation
+            report["revision_committed"] = revision_committed
+            report["protection_source"] = decision_dict["source"]
+            report["part"] = decision_dict["part"]
+        return report
 
     def trip(self, reason: str) -> str:
         """跳闸并记录原因。"""
@@ -227,6 +290,13 @@ class Receiver:
         """返回吸热器状态快照。"""
 
         flow = self._last_flow
+        if self._protection is not None:
+            decision = self._protection.last_decision()
+            derated = self._protection.active()
+            ceiling = 100.0 if decision is None else decision.ceiling_pct
+        else:
+            derated = self._derate.active()
+            ceiling = self._derate.ceiling_pct(self._sensor.value_c())
         return ReceiverSnapshot(
             state=self._state,
             temperature_c=self._sensor.value_c(),
@@ -235,7 +305,7 @@ class Receiver:
             flow_kg_s=0.0 if flow is None else flow.flow_kg_s,
             flow_confirmed=self._gate.confirmed(),
             hold_s=self._gate.hold_s(),
-            derated=self._derate.active(),
-            ceiling_pct=self._derate.ceiling_pct(self._sensor.value_c()),
+            derated=derated,
+            ceiling_pct=ceiling,
             trip_reason=self._trip_reason,
         )

@@ -139,6 +139,7 @@ class ReceiverLimits:
     flow_confirm_s: float
     valve_travel_pct_s: float
     ambient_c: float
+    derate_lead_s: float = 20.0
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "ReceiverLimits":
@@ -150,6 +151,7 @@ class ReceiverLimits:
             flow_confirm_s=_number(section, "flow_confirm_s", minimum=0.1),
             valve_travel_pct_s=_number(section, "valve_travel_pct_s", minimum=0.1),
             ambient_c=_number(section, "ambient_c"),
+            derate_lead_s=_number(section, "derate_lead_s", minimum=0.0),
         )
         if not limits.temp_target_c < limits.temp_derate_c < limits.temp_max_c:
             raise ConfigError("吸热器温度带必须满足 目标 < 降额 < 上限", component="config")
@@ -346,7 +348,7 @@ def default_config() -> PlatformConfig:
         heliostat=HeliostatLimits(0.6, 1.2, 0.9, 12.0, 450.0, 0.94),
         irradiance=IrradianceLimits(250.0, 1100.0, 30.0, 180.0),
         field=FieldLimits(320.0, 6.0, 12, 6.0),
-        receiver=ReceiverLimits(600.0, 620.0, 720.0, 42.0, 20.0, 8.0, 22.0),
+        receiver=ReceiverLimits(600.0, 620.0, 720.0, 42.0, 20.0, 8.0, 22.0, 20.0),
         salt=SaltLimits(18.0, 96.0, 1.4, 15.0, 58.0, 9.0, 2.5, 3.4),
         steam=SteamLimits(12.0, 0.8, 6.0, 30.0, 1.0),
         wash=WashLimits(90.0, 26.0, 4.0, 9.0),
@@ -388,6 +390,7 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "flow_confirm_s": cfg.receiver.flow_confirm_s,
                 "valve_travel_pct_s": cfg.receiver.valve_travel_pct_s,
                 "ambient_c": cfg.receiver.ambient_c,
+                "derate_lead_s": cfg.receiver.derate_lead_s,
             },
             "salt": {
                 "cold_level_min_pct": cfg.salt.cold_level_min_pct,

@@ -35,9 +35,20 @@ from .ns.zones import SafeZone, ZoneRegistry
 from .receiver.derate import DerateController
 from .receiver.flow import FlowGate
 from .receiver.header import SaltHeader
+from .receiver.persist import ReceiverPersistence
+from .receiver.policy import PANEL, POLICY_FINGERPRINT, describe as describe_part_policies
+from .receiver.protection import ENGINE_VERSION, ProtectionModel
 from .receiver.receiver import Receiver
+from .receiver.replay import (
+    DERATE_CLEARED,
+    DERATE_ENTERED,
+    PARAMS_COMMITTED,
+    PARAMS_RECALIBRATED,
+    verify_protection_records,
+)
+from .receiver.self_params import CalibratedParams, SelfParamError
 from .receiver.sensor import TemperatureSensor
-from .receiver.thermal import ThermalModel
+from .receiver.thermal import LOSS_KW_K, RECEIVER_CAPACITY_KJ_K, ThermalModel
 from .receiver.threshold import ThresholdModel
 from .receiver.valve import InletValve
 from .salt.loop import SaltLoop
@@ -132,6 +143,24 @@ class Platform:
 
         threshold = ThresholdModel(self.config.salt)
         thermal = ThermalModel(self.config.receiver)
+        calibrated = CalibratedParams(RECEIVER_CAPACITY_KJ_K, LOSS_KW_K, 1.0)
+        receiver_persistence = ReceiverPersistence(store)
+        try:
+            param_state, migrated, fresh = receiver_persistence.load_or_init(calibrated)
+        except SelfParamError as error:
+            # 自算参数版本无法解释：fail-closed 退回纯标定，并立即落审计告警。
+            param_state, migrated, fresh = None, [], True
+            self_recover_error = error
+        else:
+            self_recover_error = None
+        protection = ProtectionModel(
+            self.config.receiver,
+            param_state.calibrated if param_state is not None else calibrated,
+            part=PANEL,
+            derate_lead_s=self.config.receiver.derate_lead_s,
+            inlet_c=thermal.inlet_c,
+            state=param_state,
+        )
         self.receiver = Receiver(
             self.config.receiver,
             InletValve(self.config.receiver),
@@ -141,7 +170,33 @@ class Platform:
             DerateController(self.config.receiver),
             SaltHeader(self.config.salt),
             threshold,
+            protection=protection,
         )
+        self.receiver_persistence = receiver_persistence
+        self.self_param_migrations: list[int] = list(migrated)
+        if self_recover_error is not None:
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    "self_params_load_failed",
+                    severity="alarm",
+                    message="自算参数版本无法解释，保护已退回纯标定（fail-closed）",
+                    detail=self_recover_error.message,
+                )
+            )
+        elif migrated:
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    "self_params_migrated",
+                    severity="notice",
+                    message="自算参数已按迁移链升级到当前版本",
+                    applied=migrated,
+                    revision=protection.state.revision,
+                )
+            )
         self.salt = SaltLoop(
             self.config.salt,
             threshold,
@@ -312,6 +367,146 @@ class Platform:
             )
         )
         return summary
+
+    # ---- 自算保护 -----------------------------------------------------
+
+    def _publish_protection_events(self, heat: dict) -> None:
+        """把自算收紧与降额进入/退出按版本化载荷落审计（回放就靠这些字段）。"""
+
+        protection = self.receiver.protection
+        if protection is None:
+            return
+        if heat.get("revision_committed"):
+            observation = heat.get("self_params", {})
+            committed = observation.get("committed", {})
+            raw = observation.get("raw", {})
+            self.receiver_persistence.save(protection.state)
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    PARAMS_COMMITTED,
+                    severity="warning",
+                    message="自算热工参数收紧，降额保护按更保守口径生效",
+                    revision=protection.state.revision,
+                    schema=protection.state.schema,
+                    engine_version=ENGINE_VERSION,
+                    policy_fingerprint=POLICY_FINGERPRINT,
+                    part=heat.get("part"),
+                    committed=committed,
+                    raw=raw,
+                )
+            )
+        derate = heat.get("derate", {})
+        changed = derate.get("changed")
+        if changed in ("entered", "cleared"):
+            action = DERATE_ENTERED if changed == "entered" else DERATE_CLEARED
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    action,
+                    severity="warning" if changed == "entered" else "notice",
+                    message=(
+                        "进入降额：" + self._explain_derate(derate)
+                        if changed == "entered"
+                        else "退出降额，回差确认温度已回落"
+                    ),
+                    decision=derate,
+                    effective=protection.effective_params().as_dict(),
+                    committed=protection.state.committed.as_dict(),
+                    calibrated=protection.state.calibrated.as_dict(),
+                    derate_lead_s=protection.status()["derate_lead_s"],
+                )
+            )
+
+    @staticmethod
+    def _explain_derate(derate: dict) -> str:
+        """把结构化归因翻成一句可在审计正文里读的话。"""
+
+        explanation = derate.get("explanation", {})
+        if not explanation:
+            return "触发降额"
+        earlier = explanation.get("earlier_vs_calibration_s", 0.0)
+        rate = explanation.get("projected_rate_c_s", 0.0)
+        text = f"按外推温升 {rate:.4f} ℃/s，比纯标定提前 {earlier:.1f} s"
+        vs_previous = explanation.get("vs_previous")
+        if vs_previous:
+            direction = {"earlier": "更早", "later": "更晚", "same": "持平"}.get(
+                vs_previous.get("direction"), "持平"
+            )
+            text += f"；比上次{direction} {abs(vs_previous.get('lead_delta_s', 0.0)):.1f} s"
+        factors = [item for item in explanation.get("factors", []) if abs(item["ratio"] - 1.0) > 0.01]
+        if factors:
+            names = {"capacity_kj_per_k": "热容", "loss_kw_per_k": "散热", "flow_gain": "流量计增益"}
+            text += "；依据：" + "、".join(
+                f"{names.get(item['factor'], item['factor'])}={item['self']}" for item in factors
+            )
+        text += f"（参数版本 r{explanation.get('revision', 0)}）"
+        return text
+
+    def recalibrate_receiver(
+        self,
+        capacity_kj_per_k: float,
+        loss_kw_per_k: float,
+        flow_gain: float = 1.0,
+        operator: str = "maintenance",
+    ) -> dict:
+        """检修后重新标定吸热器热工参数（自算棘轮唯一的放松入口）。"""
+
+        with self._lock:
+            protection = self.receiver.protection
+            if protection is None:
+                raise SelfParamError("未挂版本化保护模型", component="receiver")
+            state = protection.recalibrate(
+                capacity_kj_per_k, loss_kw_per_k, flow_gain, self.clock.now(), operator
+            )
+            self.receiver_persistence.save(state)
+            self.bus.publish(
+                Event.of(
+                    "receiver",
+                    "receiver",
+                    PARAMS_RECALIBRATED,
+                    severity="notice",
+                    message="吸热器热工参数检修后重新标定，自算棘轮已按新基线放松",
+                    revision=state.revision,
+                    schema=state.schema,
+                    engine_version=ENGINE_VERSION,
+                    policy_fingerprint=POLICY_FINGERPRINT,
+                    operator=operator,
+                    calibrated=state.calibrated.as_dict(),
+                )
+            )
+            return protection.status()
+
+    def degrade_receiver(
+        self,
+        *,
+        capacity_kj_per_k: float | None = None,
+        loss_kw_per_k: float | None = None,
+        flow_gain: float | None = None,
+    ) -> dict:
+        """注入一次真值侧漂移（仿真/验证用：结焦、保温老化、流量计漂移）。"""
+
+        with self._lock:
+            self.receiver.thermal.degrade(
+                capacity_kj_per_k=capacity_kj_per_k,
+                loss_kw_per_k=loss_kw_per_k,
+                flow_gain=flow_gain,
+            )
+            return {
+                "capacity_kj_per_k": self.receiver.thermal.capacity_kj_per_k,
+                "loss_kw_per_k": self.receiver.thermal.loss_kw_per_k,
+                "flow_gain": self.receiver.thermal.flow_gain,
+            }
+
+    def verify_protection_replay(self, limit: int = 100_000) -> dict:
+        """从落盘审计流水按当时版本回放保护判定并核对一致性。"""
+
+        with self._lock:
+            raw = self.audit.replay_from_journal(limit=limit)
+            verdict = verify_protection_records(raw, self.config.receiver)
+            return verdict.as_dict()
 
     # ---- 生命周期 -----------------------------------------------------
 
@@ -568,7 +763,8 @@ class Platform:
             power_kw = self.field.thermal_power_kw()
             dispatch_pct = self.field.step_dispatch(dt)
             if self.receiver.header.state() == "admitted":
-                heat = self.receiver.heat(power_kw, self.salt.flow_kg_s(), dt)
+                heat = self.receiver.heat(power_kw, self.salt.flow_kg_s(), dt, moment)
+                self._publish_protection_events(heat)
             else:
                 heat = {
                     "ok": True,
@@ -726,12 +922,46 @@ class Platform:
             "receiver": self.receiver.snapshot().as_dict(),
             "receiver_heat_steps": self.receiver.heat_steps(),
             "derate_state": {
-                "entries": self.receiver.derate.entries(),
-                "clears": self.receiver.derate.clears(),
-                "evaluations": self.receiver.derate.evaluation_count(),
-                "min_ceiling_pct": round(self.receiver.derate.min_ceiling_pct(), 3),
-                "last_temperature_c": round(self.receiver.derate.last_temperature_c(), 2),
+                "entries": (
+                    self.receiver.protection.entries()
+                    if self.receiver.has_versioned_protection()
+                    else self.receiver.derate.entries()
+                ),
+                "clears": (
+                    self.receiver.protection.clears()
+                    if self.receiver.has_versioned_protection()
+                    else self.receiver.derate.clears()
+                ),
+                "evaluations": (
+                    self.receiver.protection.evaluation_count()
+                    if self.receiver.has_versioned_protection()
+                    else self.receiver.derate.evaluation_count()
+                ),
+                "min_ceiling_pct": round(
+                    (
+                        self.receiver.protection.min_ceiling_pct()
+                        if self.receiver.has_versioned_protection()
+                        else self.receiver.derate.min_ceiling_pct()
+                    ),
+                    3,
+                ),
+                "last_temperature_c": round(
+                    (
+                        self.receiver.protection.last_temperature_c()
+                        if self.receiver.has_versioned_protection()
+                        else self.receiver.derate.last_temperature_c()
+                    ),
+                    2,
+                ),
+                "versioned": self.receiver.has_versioned_protection(),
             },
+            "self_params": (
+                self.receiver.protection.status()
+                if self.receiver.has_versioned_protection()
+                else {"versioned": False}
+            ),
+            "protection_policy": {"fingerprint": POLICY_FINGERPRINT, "engine_version": ENGINE_VERSION,
+                                   "parts": describe_part_policies()},
             "flow_gate": {
                 "hold_s": round(self.receiver.gate.hold_s(), 3),
                 "resets": self.receiver.gate.resets(),
@@ -741,6 +971,8 @@ class Platform:
             "thermal": {
                 "inlet_c": self.receiver.thermal.inlet_c,
                 "capacity_kj_per_k": self.receiver.thermal.capacity_kj_per_k,
+                "loss_kw_per_k": self.receiver.thermal.loss_kw_per_k,
+                "flow_gain": self.receiver.thermal.flow_gain,
                 "updates": self.receiver.thermal.updates(),
                 "dry_steps": self.receiver.thermal.dry_steps(),
                 "peak_c": round(self.receiver.thermal.peak_c(), 2),
